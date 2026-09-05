@@ -16,13 +16,14 @@ import (
 
 // DeploymentConfig holds the resolved CLI flags passed from cmd/.
 type DeploymentConfig struct {
-	Cluster     string
-	Service     string
-	Container   string
-	ImageTag    string // empty means skip image update
-	SSMPrefixes []string
-	AutoApprove bool
-	NoWait      bool
+	Cluster          string
+	Service          string
+	Container        string
+	ImageTag         string // empty means skip image update
+	SSMPrefixes      []string
+	VersionParameter string // empty means do not record the deployed tag
+	AutoApprove      bool
+	NoWait           bool
 }
 
 const deploymentTimeout = 30 * time.Minute
@@ -69,7 +70,17 @@ func RunDeployment(ctx context.Context, clients *Clients, cfg DeploymentConfig) 
 		return "", nil
 	}
 
-	printDeploymentPlan(cfg.Container, oldImage, newImage, secretChanges, len(cfg.SSMPrefixes) > 0)
+	// Read the version parameter before the plan is printed so the operator sees
+	// the value it will move from, not just the value it will move to.
+	var versionParam *versionParameter
+	if cfg.VersionParameter != "" {
+		versionParam, err = readVersionParameter(ctx, clients.SSM, cfg.VersionParameter, cfg.ImageTag)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	printDeploymentPlan(cfg.Container, oldImage, newImage, secretChanges, len(cfg.SSMPrefixes) > 0, versionParam)
 
 	if !cfg.AutoApprove {
 		ok, err := confirmChanges(ctx, os.Stdin)
@@ -79,6 +90,18 @@ func RunDeployment(ctx context.Context, clients *Clients, cfg DeploymentConfig) 
 		if !ok {
 			return "", fmt.Errorf("deployment cancelled by user")
 		}
+	}
+
+	// Record the deployed tag BEFORE the service is updated. The parameter is
+	// commonly injected into the container too, and ECS resolves that at task
+	// start — writing it afterwards leaves the new task reporting the version it
+	// replaced. Writing first also means a failure here aborts before anything
+	// about the service has changed.
+	if versionParam != nil && versionParam.changed() {
+		if err := writeVersionParameter(ctx, clients.SSM, versionParam); err != nil {
+			return "", err
+		}
+		fmt.Printf("Version parameter %s set to %s\n", versionParam.path, versionParam.to)
 	}
 
 	// Apply changes.
@@ -93,14 +116,18 @@ func RunDeployment(ctx context.Context, clients *Clients, cfg DeploymentConfig) 
 		containers = applyChangesToContainers(containers, cfg.Container, cfg.SSMPrefixes, ssmParams)
 	}
 
+	// From here on the version parameter may already name a tag that is not
+	// running. Every failure path has to say so rather than exit silently — a
+	// parameter disagreeing with the service is the exact condition it exists to
+	// prevent, and it is invisible until infrastructure-as-code acts on it.
 	newARN, err := registerTaskDefinition(ctx, clients.ECS, existing, containers, tags)
 	if err != nil {
-		return "", err
+		return "", withVersionWarning(err, versionParam)
 	}
 	fmt.Printf("Registered new task definition: %s\n", newARN)
 
 	if err := updateService(ctx, clients.ECS, cfg.Cluster, cfg.Service, newARN); err != nil {
-		return "", err
+		return "", withVersionWarning(err, versionParam)
 	}
 
 	if cfg.NoWait {
@@ -112,10 +139,20 @@ func RunDeployment(ctx context.Context, clients *Clients, cfg DeploymentConfig) 
 		deplCfg.DeploymentCircuitBreaker.Rollback
 
 	if err := pollDeployment(ctx, clients.ECS, cfg.Cluster, cfg.Service, newARN, cbRollbackEnabled); err != nil {
-		return "", err
+		return "", withVersionWarning(err, versionParam)
 	}
 
 	return newARN, nil
+}
+
+// withVersionWarning prints the rollback guidance for an already-written version
+// parameter and returns the original error unchanged, so callers can wrap a
+// failure path without altering what the command reports.
+func withVersionWarning(err error, v *versionParameter) error {
+	if msg := describeVersionRollback(v); msg != "" {
+		fmt.Fprintf(os.Stderr, "\n%s", msg)
+	}
+	return err
 }
 
 // containerImage returns the current image string for the named container.
@@ -128,11 +165,22 @@ func containerImage(containers []ecstypes.ContainerDefinition, name string) stri
 	return ""
 }
 
-func printDeploymentPlan(containerName, oldImage, newImage string, secretChanges []secretChange, ssmRequested bool) {
+func printDeploymentPlan(containerName, oldImage, newImage string, secretChanges []secretChange, ssmRequested bool, versionParam *versionParameter) {
 	fmt.Printf("\nDeployment plan for container %q:\n", containerName)
 
 	if newImage != "" {
 		fmt.Printf("  image:  %s\n          -> %s\n", oldImage, newImage)
+	}
+
+	if versionParam != nil {
+		switch {
+		case !versionParam.existed:
+			fmt.Printf("  version: %s\n           (does not exist) -> %s\n", versionParam.path, versionParam.to)
+		case versionParam.changed():
+			fmt.Printf("  version: %s\n           %s -> %s\n", versionParam.path, versionParam.from, versionParam.to)
+		default:
+			fmt.Printf("  version: %s already %s\n", versionParam.path, versionParam.to)
+		}
 	}
 
 	if ssmRequested {

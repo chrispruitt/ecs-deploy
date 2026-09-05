@@ -10,14 +10,15 @@ import (
 )
 
 type config struct {
-	Cluster     string
-	Service     string
-	Container   string
-	ImageTag    string
-	Role        string
-	SSMPrefixes []string
-	AutoApprove bool
-	NoWait      bool
+	Cluster      string
+	Service      string
+	Container    string
+	ImageTag     string
+	Role         string
+	SSMPrefixes  []string
+	VersionParam string
+	AutoApprove  bool
+	NoWait       bool
 }
 
 var cfg config
@@ -51,6 +52,7 @@ func init() {
 	rootCmd.Flags().StringVar(&cfg.ImageTag, "image-tag", "", "New container image tag (required unless --secret-ssm-prefix is set)")
 	rootCmd.Flags().StringVar(&cfg.Role, "role", "", "IAM role ARN to assume")
 	rootCmd.Flags().StringArrayVar(&cfg.SSMPrefixes, "secret-ssm-prefix", nil, "SSM path prefix to sync as container secrets (repeatable)")
+	rootCmd.Flags().StringVar(&cfg.VersionParam, "version-parameter", "", "SSM parameter path to write --image-tag to before deploying (e.g. /prod/my-service/VERSION)")
 	rootCmd.Flags().BoolVar(&cfg.AutoApprove, "auto-approve", false, "Skip the secrets diff approval prompt")
 	rootCmd.Flags().BoolVar(&cfg.NoWait, "no-wait", false, "Exit after registering the task definition without waiting for deployment")
 
@@ -64,6 +66,12 @@ func runDeploy(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("at least one of --image-tag or --secret-ssm-prefix must be provided")
 	}
 
+	// There is nothing to record without a tag, and silently writing an empty
+	// value would be worse than refusing.
+	if cfg.VersionParam != "" && cfg.ImageTag == "" {
+		return fmt.Errorf("--version-parameter requires --image-tag: there is no tag to record")
+	}
+
 	ctx := cmd.Context()
 
 	clients, err := internal.NewClients(ctx, cfg.Role)
@@ -72,13 +80,14 @@ func runDeploy(cmd *cobra.Command, _ []string) error {
 	}
 
 	newARN, err := internal.RunDeployment(ctx, clients, internal.DeploymentConfig{
-		Cluster:     cfg.Cluster,
-		Service:     cfg.Service,
-		Container:   cfg.Container,
-		ImageTag:    cfg.ImageTag,
-		SSMPrefixes: cfg.SSMPrefixes,
-		AutoApprove: cfg.AutoApprove,
-		NoWait:      cfg.NoWait,
+		Cluster:          cfg.Cluster,
+		Service:          cfg.Service,
+		Container:        cfg.Container,
+		ImageTag:         cfg.ImageTag,
+		SSMPrefixes:      cfg.SSMPrefixes,
+		VersionParameter: cfg.VersionParam,
+		AutoApprove:      cfg.AutoApprove,
+		NoWait:           cfg.NoWait,
 	})
 	if err != nil {
 		return err
