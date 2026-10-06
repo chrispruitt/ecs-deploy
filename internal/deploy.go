@@ -29,6 +29,11 @@ type DeploymentConfig struct {
 const deploymentTimeout = 30 * time.Minute
 const pollInterval = 10 * time.Second
 
+// errRolloutFailed marks a deployment ECS itself reported as FAILED, as opposed
+// to one whose outcome is unknown (timeout, interrupt, API error while polling).
+// Only the former is certain not to end up running the new task definition.
+var errRolloutFailed = errors.New("deployment FAILED")
+
 // RunDeployment executes the full deployment sequence and returns the new task
 // definition ARN. Returns ("", nil) when no changes are detected.
 // On --no-wait, it returns after updating the service.
@@ -117,17 +122,18 @@ func RunDeployment(ctx context.Context, clients *Clients, cfg DeploymentConfig) 
 	}
 
 	// From here on the version parameter may already name a tag that is not
-	// running. Every failure path has to say so rather than exit silently — a
-	// parameter disagreeing with the service is the exact condition it exists to
-	// prevent, and it is invisible until infrastructure-as-code acts on it.
+	// running — the exact condition it exists to prevent, and invisible until
+	// infrastructure-as-code acts on it. Where the new tag is certain not to be
+	// running, the parameter is rolled back; where the outcome is unknown, it is
+	// left alone and the failure says so rather than exiting silently.
 	newARN, err := registerTaskDefinition(ctx, clients.ECS, existing, containers, tags)
 	if err != nil {
-		return "", withVersionWarning(err, versionParam)
+		return "", withVersionRollback(ctx, clients.SSM, err, versionParam)
 	}
 	fmt.Printf("Registered new task definition: %s\n", newARN)
 
 	if err := updateService(ctx, clients.ECS, cfg.Cluster, cfg.Service, newARN); err != nil {
-		return "", withVersionWarning(err, versionParam)
+		return "", withVersionRollback(ctx, clients.SSM, err, versionParam)
 	}
 
 	if cfg.NoWait {
@@ -139,10 +145,32 @@ func RunDeployment(ctx context.Context, clients *Clients, cfg DeploymentConfig) 
 		deplCfg.DeploymentCircuitBreaker.Rollback
 
 	if err := pollDeployment(ctx, clients.ECS, cfg.Cluster, cfg.Service, newARN, cbRollbackEnabled); err != nil {
+		// A timeout or interrupt leaves the rollout running and it may still
+		// complete; restoring the old tag then would create the disagreement
+		// instead of fixing it.
+		if errors.Is(err, errRolloutFailed) {
+			return "", withVersionRollback(ctx, clients.SSM, err, versionParam)
+		}
 		return "", withVersionWarning(err, versionParam)
 	}
 
 	return newARN, nil
+}
+
+// withVersionRollback restores an already-written version parameter after a
+// deployment that is certain not to be running the new tag, and returns the
+// original error unchanged. If the restore itself fails, it falls back to the
+// manual guidance from withVersionWarning.
+func withVersionRollback(ctx context.Context, client versionParameterAPI, err error, v *versionParameter) error {
+	// Restore even if the deploy was interrupted at the same moment.
+	if restoreErr := restoreVersionParameter(context.WithoutCancel(ctx), client, v); restoreErr != nil {
+		fmt.Fprintf(os.Stderr, "\n%v\n", restoreErr)
+		return withVersionWarning(err, v)
+	}
+	if msg := describeVersionRestore(v); msg != "" {
+		fmt.Fprintf(os.Stderr, "\n%s", msg)
+	}
+	return err
 }
 
 // withVersionWarning prints the rollback guidance for an already-written version
@@ -384,11 +412,11 @@ func pollDeployment(
 				reason := aws.ToString(d.RolloutStateReason)
 				if strings.Contains(strings.ToLower(reason), "circuit breaker") {
 					if cbRollbackEnabled {
-						return fmt.Errorf("deployment FAILED: ECS circuit breaker triggered auto-rollback — %s", reason)
+						return fmt.Errorf("%w: ECS circuit breaker triggered auto-rollback — %s", errRolloutFailed, reason)
 					}
-					return fmt.Errorf("deployment FAILED: ECS circuit breaker triggered (rollback disabled) — %s", reason)
+					return fmt.Errorf("%w: ECS circuit breaker triggered (rollback disabled) — %s", errRolloutFailed, reason)
 				}
-				return fmt.Errorf("deployment FAILED: rollout state is FAILED — %s", reason)
+				return fmt.Errorf("%w: rollout state is FAILED — %s", errRolloutFailed, reason)
 
 			case ecstypes.DeploymentRolloutStateInProgress:
 				fmt.Printf("[%s] Deployment in progress: running=%d/%d pending=%d failed=%d\n",
