@@ -47,7 +47,7 @@ ecs-deploy --cluster <cluster> --service <service> --container <container> [flag
 | `--container` | yes | Name of the container to update |
 | `--image-tag` | one of image-tag or ssm-prefix | New image tag to deploy |
 | `--secret-ssm-prefix` | one of image-tag or ssm-prefix | SSM path prefix to sync as container secrets (repeatable) |
-| `--version-parameter` | no | SSM parameter path to record `--image-tag` in, written before the deploy. Requires `--image-tag`. |
+| `--version-parameter` | no | SSM parameter path to record `--image-tag` in, written before the deploy and rolled back if the deploy fails. Requires `--image-tag`. |
 | `--role` | no | IAM role ARN to assume before making API calls |
 | `--auto-approve` | no | Skip the interactive approval prompt |
 | `--no-wait` | no | Exit after registering the task definition without waiting for the rollout |
@@ -207,10 +207,18 @@ Details worth knowing:
   when the parameter sits under a path passed to `--secret-ssm-prefix`.
 - **Redeploying the same tag writes nothing**, and the plan says
   `already <tag>` rather than showing a no-op change.
-- **If the deployment fails after the write**, the parameter names a tag that is
-  not running. That is the exact disagreement it exists to prevent, so the tool
-  prints the previous value and the command to restore it rather than exiting
-  silently.
+- **If the deployment fails after the write, the parameter is rolled back.** A
+  parameter naming a tag that is not running is the exact disagreement it exists
+  to prevent, so when the new tag is certain not to be running — registering the
+  task definition or updating the service fails, or ECS reports the rollout
+  `FAILED` (including a circuit-breaker rollback) — the previous value is put
+  back. A parameter this deploy created is deleted instead.
+- **An unknown outcome is not rolled back.** A timeout, an interrupt (Ctrl-C),
+  or an API error while polling leaves the rollout running in ECS, and it may
+  still complete; restoring the old tag then would create the disagreement
+  rather than fix it. In those cases, and if the rollback itself fails, the tool
+  prints the previous value and the command to restore it instead of exiting
+  silently. `--no-wait` never sees the outcome, so it never rolls back.
 
 ---
 
@@ -249,7 +257,8 @@ The IAM principal (or assumed role) needs:
 ```
 
 `--version-parameter` additionally needs `ssm:GetParameter` and
-`ssm:PutParameter` on that parameter.
+`ssm:PutParameter` on that parameter, plus `ssm:DeleteParameter` to roll back a
+parameter that did not exist before the deploy.
 
 If `--role` is used, also add `sts:AssumeRole` on the target role ARN.
 
