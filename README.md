@@ -257,8 +257,12 @@ The IAM principal (or assumed role) needs:
 ```
 
 `--version-parameter` additionally needs `ssm:GetParameter` and
-`ssm:PutParameter` on that parameter, plus `ssm:DeleteParameter` to roll back a
-parameter that did not exist before the deploy.
+`ssm:PutParameter` on that parameter.
+
+`ssm:DeleteParameter` is optional. It is only used to roll back a parameter that
+a failed deploy created, since there is no previous value to restore. Without
+it, a parameter that already exists still rolls back, and a newly created one
+falls back to printing the `delete-parameter` command to run by hand.
 
 If `--role` is used, also add `sts:AssumeRole` on the target role ARN.
 
