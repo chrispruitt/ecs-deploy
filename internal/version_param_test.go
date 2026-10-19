@@ -12,19 +12,28 @@ import (
 )
 
 // fakeSSM records the writes made to it. putErr/deleteErr, when set, are
-// returned from the corresponding call.
+// returned from the corresponding call. value, when set, is what GetParameter
+// returns; otherwise GetParameter is unexpected. log, when set, records the
+// order of calls alongside other fakes.
 type fakeSSM struct {
 	puts      []*ssm.PutParameterInput
 	deletes   []string
 	putErr    error
 	deleteErr error
+	value     *string
+	log       *callLog
 }
 
-func (f *fakeSSM) GetParameter(context.Context, *ssm.GetParameterInput, ...func(*ssm.Options)) (*ssm.GetParameterOutput, error) {
-	return nil, errors.New("GetParameter not expected")
+func (f *fakeSSM) GetParameter(_ context.Context, in *ssm.GetParameterInput, _ ...func(*ssm.Options)) (*ssm.GetParameterOutput, error) {
+	f.log.add("GetParameter")
+	if f.value == nil {
+		return nil, errors.New("GetParameter not expected")
+	}
+	return &ssm.GetParameterOutput{Parameter: &ssmtypes.Parameter{Name: in.Name, Value: f.value}}, nil
 }
 
 func (f *fakeSSM) PutParameter(ctx context.Context, in *ssm.PutParameterInput, _ ...func(*ssm.Options)) (*ssm.PutParameterOutput, error) {
+	f.log.add("PutParameter")
 	// Like the real client, a cancelled context fails the call.
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -34,8 +43,14 @@ func (f *fakeSSM) PutParameter(ctx context.Context, in *ssm.PutParameterInput, _
 }
 
 func (f *fakeSSM) DeleteParameter(_ context.Context, in *ssm.DeleteParameterInput, _ ...func(*ssm.Options)) (*ssm.DeleteParameterOutput, error) {
+	f.log.add("DeleteParameter")
 	f.deletes = append(f.deletes, aws.ToString(in.Name))
 	return &ssm.DeleteParameterOutput{}, f.deleteErr
+}
+
+func (f *fakeSSM) GetParametersByPath(context.Context, *ssm.GetParametersByPathInput, ...func(*ssm.Options)) (*ssm.GetParametersByPathOutput, error) {
+	f.log.add("GetParametersByPath")
+	return &ssm.GetParametersByPathOutput{}, nil
 }
 
 func TestVersionParameterChanged(t *testing.T) {
