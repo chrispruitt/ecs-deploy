@@ -31,7 +31,7 @@ func (c secretChange) action() string {
 
 // fetchSSMParameters returns a map of envVarName -> parameterARN for all
 // parameters under each prefix, using paginated GetParametersByPath calls.
-func fetchSSMParameters(ctx context.Context, client *ssm.Client, prefixes []string) (map[string]string, error) {
+func fetchSSMParameters(ctx context.Context, client ssmAPI, prefixes []string) (map[string]string, error) {
 	result := make(map[string]string)
 	for _, prefix := range prefixes {
 		norm := normalizeSSMPrefix(prefix)

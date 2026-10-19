@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -19,6 +20,9 @@ type config struct {
 	VersionParam string
 	AutoApprove  bool
 	NoWait       bool
+
+	ReleaseCommand string
+	ReleaseTimeout time.Duration
 }
 
 var cfg config
@@ -55,6 +59,8 @@ func init() {
 	rootCmd.Flags().StringVar(&cfg.VersionParam, "version-parameter", "", "SSM parameter path to write --image-tag to before deploying (e.g. /prod/my-service/VERSION)")
 	rootCmd.Flags().BoolVar(&cfg.AutoApprove, "auto-approve", false, "Skip the secrets diff approval prompt")
 	rootCmd.Flags().BoolVar(&cfg.NoWait, "no-wait", false, "Exit after registering the task definition without waiting for deployment")
+	rootCmd.Flags().StringVar(&cfg.ReleaseCommand, "release-command", "", "Command to run as a one-off task from the new revision before the service is updated; a non-zero exit aborts the deploy")
+	rootCmd.Flags().DurationVar(&cfg.ReleaseTimeout, "release-timeout", 30*time.Minute, "How long to wait for --release-command before stopping it and failing the deploy (e.g. 45m, 4h)")
 
 	_ = rootCmd.MarkFlagRequired("cluster")
 	_ = rootCmd.MarkFlagRequired("service")
@@ -70,6 +76,15 @@ func runDeploy(cmd *cobra.Command, _ []string) error {
 	// value would be worse than refusing.
 	if cfg.VersionParam != "" && cfg.ImageTag == "" {
 		return fmt.Errorf("--version-parameter requires --image-tag: there is no tag to record")
+	}
+
+	var releaseCommand []string
+	if cfg.ReleaseCommand != "" {
+		var err error
+		releaseCommand, err = internal.SplitCommand(cfg.ReleaseCommand)
+		if err != nil {
+			return fmt.Errorf("invalid --release-command: %w", err)
+		}
 	}
 
 	ctx := cmd.Context()
@@ -88,6 +103,8 @@ func runDeploy(cmd *cobra.Command, _ []string) error {
 		VersionParameter: cfg.VersionParam,
 		AutoApprove:      cfg.AutoApprove,
 		NoWait:           cfg.NoWait,
+		ReleaseCommand:   releaseCommand,
+		ReleaseTimeout:   cfg.ReleaseTimeout,
 	})
 	if err != nil {
 		return err
