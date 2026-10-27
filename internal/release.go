@@ -2,6 +2,8 @@ package internal
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -81,7 +83,10 @@ type launchConfig struct {
 	CapacityProviderStrategy []ecstypes.CapacityProviderStrategyItem
 	PlatformVersion          *string
 	NetworkConfiguration     *ecstypes.NetworkConfiguration
-	HasTags                  bool
+	// Tags are the service's own tags, applied to the one-off task directly.
+	// RunTask rejects propagateTags=SERVICE (that value is only valid for
+	// tasks a service launches), so they are copied rather than propagated.
+	Tags []ecstypes.Tag
 }
 
 // launchConfigFromService copies the launch settings a service uses. A service
@@ -90,7 +95,7 @@ func launchConfigFromService(svc ecstypes.Service) launchConfig {
 	lc := launchConfig{
 		PlatformVersion:      svc.PlatformVersion,
 		NetworkConfiguration: svc.NetworkConfiguration,
-		HasTags:              len(svc.Tags) > 0,
+		Tags:                 userTags(svc.Tags),
 	}
 	if len(svc.CapacityProviderStrategy) > 0 {
 		lc.CapacityProviderStrategy = svc.CapacityProviderStrategy
@@ -100,8 +105,35 @@ func launchConfigFromService(svc ecstypes.Service) launchConfig {
 	return lc
 }
 
+// userTags drops tags with the reserved "aws:" prefix, which ECS manages
+// itself and refuses in a RunTask request.
+func userTags(tags []ecstypes.Tag) []ecstypes.Tag {
+	var out []ecstypes.Tag
+	for _, tag := range tags {
+		if !strings.HasPrefix(strings.ToLower(aws.ToString(tag.Key)), "aws:") {
+			out = append(out, tag)
+		}
+	}
+	return out
+}
+
+// newClientToken returns a fresh RunTask idempotency token. The SDK fills
+// ClientToken on the caller's input struct when it is nil, so a second RunTask
+// sent with the same (modified) struct would reuse the first token and ECS
+// answers ConflictException. Every attempt therefore gets its own token.
+func newClientToken() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("crypto/rand: %v", err))
+	}
+	return hex.EncodeToString(b)
+}
+
+// runTaskInput builds a fresh RunTask request, with its own client token, each
+// time it is called.
 func (t releaseTask) runTaskInput() *ecs.RunTaskInput {
 	in := &ecs.RunTaskInput{
+		ClientToken:          aws.String(newClientToken()),
 		Cluster:              aws.String(t.Cluster),
 		TaskDefinition:       aws.String(t.TaskDefinitionARN),
 		Count:                aws.Int32(1),
@@ -121,8 +153,8 @@ func (t releaseTask) runTaskInput() *ecs.RunTaskInput {
 	} else {
 		in.LaunchType = t.Launch.LaunchType
 	}
-	if t.Launch.HasTags {
-		in.PropagateTags = ecstypes.PropagateTagsService
+	if len(t.Launch.Tags) > 0 {
+		in.Tags = t.Launch.Tags
 	}
 	return in
 }
@@ -141,16 +173,17 @@ func runReleaseTaskTo(ctx context.Context, clients *Clients, t releaseTask, out 
 
 	in := t.runTaskInput()
 	resp, err := clients.ECS.RunTask(ctx, in)
+	if err != nil && len(in.Tags) > 0 {
+		// Tags are best-effort: retry once without them rather than fail a
+		// release over a tagging permission. The retry is a new request with
+		// a new client token; reusing the first one is a ConflictException.
+		fmt.Fprintf(os.Stderr, "warning: RunTask with tags failed, retrying without tags: %v\n", err)
+		retry := t.runTaskInput()
+		retry.Tags = nil
+		resp, err = clients.ECS.RunTask(ctx, retry)
+	}
 	if err != nil {
-		// PropagateTags is best-effort: retry once without it rather than fail
-		// a release over a tagging permission.
-		if in.PropagateTags != "" {
-			in.PropagateTags = ""
-			resp, err = clients.ECS.RunTask(ctx, in)
-		}
-		if err != nil {
-			return &ExitError{Code: ExitFailedToStart, Err: fmt.Errorf("failed to start release task: %w", err)}
-		}
+		return &ExitError{Code: ExitFailedToStart, Err: fmt.Errorf("failed to start release task: %w", err)}
 	}
 	if len(resp.Failures) > 0 {
 		reasons := make([]string, 0, len(resp.Failures))

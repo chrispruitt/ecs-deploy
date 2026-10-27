@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -35,6 +36,11 @@ type fakeECS struct {
 
 	runOut *ecs.RunTaskOutput
 	runErr error
+	// runErrs, when set, are returned by successive RunTask calls in order (a
+	// nil entry lets that call through), before runErr applies.
+	runErrs []error
+	// runTokens maps each client token seen to the request it came with.
+	runTokens map[string]string
 
 	describeTasks    []*ecs.DescribeTasksOutput
 	describeTasksIdx int
@@ -81,7 +87,34 @@ func (f *fakeECS) UpdateService(_ context.Context, in *ecs.UpdateServiceInput, _
 func (f *fakeECS) RunTask(_ context.Context, in *ecs.RunTaskInput, _ ...func(*ecs.Options)) (*ecs.RunTaskOutput, error) {
 	f.log.add("RunTask")
 	f.runs = append(f.runs, in)
-	if f.runErr != nil {
+
+	// Like the SDK's idempotency middleware: a nil ClientToken is filled in on
+	// the caller's own input struct.
+	if in.ClientToken == nil {
+		in.ClientToken = aws.String(fmt.Sprintf("sdk-token-%d", len(f.runs)))
+	}
+	// Like ECS: a token reused with a different request is a conflict, and
+	// propagateTags=SERVICE is invalid outside a service.
+	req := *in
+	req.ClientToken = nil
+	body, _ := json.Marshal(req)
+	if f.runTokens == nil {
+		f.runTokens = map[string]string{}
+	}
+	token := aws.ToString(in.ClientToken)
+	if prev, ok := f.runTokens[token]; ok && prev != string(body) {
+		return nil, errors.New("ConflictException: The provided clientToken is already in use with a different request.")
+	}
+	f.runTokens[token] = string(body)
+	if in.PropagateTags == ecstypes.PropagateTagsService {
+		return nil, errors.New("InvalidParameterException: propagateTags SERVICE is not valid for RunTask")
+	}
+
+	if n := len(f.runs) - 1; n < len(f.runErrs) {
+		if err := f.runErrs[n]; err != nil {
+			return nil, err
+		}
+	} else if f.runErr != nil {
 		return nil, f.runErr
 	}
 	if f.runOut != nil {
