@@ -323,8 +323,9 @@ Details worth knowing:
 - The release task starts before the version parameter is written, so a
   parameter injected into the container still reads the previous value during
   the release step.
-- Tags are propagated from the service when it has any. If that is denied, the
-  task is started again without propagation rather than failing the release.
+- The service's tags are copied onto the task when it has any. If that is
+  denied, the task is started again without tags rather than failing the
+  release.
 
 ---
 

@@ -223,8 +223,14 @@ func TestRunTaskInput_CopiesServiceLaunchConfig(t *testing.T) {
 		if aws.ToInt32(in.Count) != 1 || aws.ToString(in.StartedBy) != "ecs-deploy" || in.EnableExecuteCommand {
 			t.Errorf("count=%d startedBy=%q enableExecuteCommand=%v", aws.ToInt32(in.Count), aws.ToString(in.StartedBy), in.EnableExecuteCommand)
 		}
-		if in.PropagateTags != ecstypes.PropagateTagsService {
-			t.Errorf("a tagged service should propagate tags, got %q", in.PropagateTags)
+		if in.PropagateTags != "" {
+			t.Errorf("RunTask rejects propagateTags=SERVICE; got %q", in.PropagateTags)
+		}
+		if len(in.Tags) != 1 || aws.ToString(in.Tags[0].Key) != "env" || aws.ToString(in.Tags[0].Value) != "prod" {
+			t.Errorf("a tagged service's tags should be copied onto the task, got %+v", in.Tags)
+		}
+		if aws.ToString(in.ClientToken) == "" {
+			t.Error("each RunTask request should carry its own client token")
 		}
 		ov := in.Overrides.ContainerOverrides
 		if len(ov) != 1 || aws.ToString(ov[0].Name) != testContainer || strings.Join(ov[0].Command, " ") != "migrate up" {
@@ -244,8 +250,8 @@ func TestRunTaskInput_CopiesServiceLaunchConfig(t *testing.T) {
 		if in.LaunchType != "" || len(in.CapacityProviderStrategy) != 1 || aws.ToString(in.CapacityProviderStrategy[0].CapacityProvider) != "FARGATE_SPOT" {
 			t.Errorf("launchType=%q strategy=%+v, want only the strategy", in.LaunchType, in.CapacityProviderStrategy)
 		}
-		if in.PropagateTags != "" {
-			t.Errorf("an untagged service must not propagate tags, got %q", in.PropagateTags)
+		if in.PropagateTags != "" || len(in.Tags) != 0 {
+			t.Errorf("an untagged service must not tag the task, got propagate=%q tags=%+v", in.PropagateTags, in.Tags)
 		}
 	})
 }
@@ -311,5 +317,53 @@ func TestStartLogTail_NonAwslogsHint(t *testing.T) {
 	}
 	if logs.calls != 0 {
 		t.Errorf("must not call GetLogEvents for a non-awslogs container, got %d calls", logs.calls)
+	}
+}
+
+// Regression: v0.4.0 sent propagateTags=SERVICE (always rejected by RunTask)
+// and then retried with the same input struct, which the SDK had already
+// stamped with a client token — so ECS answered ConflictException and every
+// release against a tagged service failed to start.
+func TestRunReleaseTask_TaggedServiceStarts(t *testing.T) {
+	e := &fakeECS{describeTasks: []*ecs.DescribeTasksOutput{taskState("STOPPED", "STOPPED", aws.Int32(0))}}
+	err := runReleaseTaskTo(context.Background(), newTestClients(e, &fakeSSM{}, nil), testReleaseTask(time.Minute), &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("release against a tagged service should start: %v", err)
+	}
+	if len(e.runs) != 1 {
+		t.Errorf("RunTask calls = %d, want 1", len(e.runs))
+	}
+}
+
+// When the tagged RunTask is refused (e.g. no ecs:TagResource), the retry
+// without tags must be a new request with a new client token.
+func TestRunReleaseTask_TagRetryUsesNewClientToken(t *testing.T) {
+	e := &fakeECS{
+		runErrs:       []error{errors.New("AccessDeniedException: ecs:TagResource")},
+		describeTasks: []*ecs.DescribeTasksOutput{taskState("STOPPED", "STOPPED", aws.Int32(0))},
+	}
+	err := runReleaseTaskTo(context.Background(), newTestClients(e, &fakeSSM{}, nil), testReleaseTask(time.Minute), &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("retry without tags should start the task: %v", err)
+	}
+	if len(e.runs) != 2 {
+		t.Fatalf("RunTask calls = %d, want 2", len(e.runs))
+	}
+	if len(e.runs[1].Tags) != 0 {
+		t.Errorf("retry should drop tags, got %+v", e.runs[1].Tags)
+	}
+	if aws.ToString(e.runs[0].ClientToken) == aws.ToString(e.runs[1].ClientToken) {
+		t.Errorf("retry reused client token %q", aws.ToString(e.runs[0].ClientToken))
+	}
+}
+
+func TestLaunchConfigFromService_DropsReservedTags(t *testing.T) {
+	svc := testFargateService()
+	svc.Tags = append(svc.Tags, ecstypes.Tag{Key: aws.String("aws:cloudformation:stack-name"), Value: aws.String("x")})
+	lc := launchConfigFromService(svc)
+	for _, tag := range lc.Tags {
+		if strings.HasPrefix(aws.ToString(tag.Key), "aws:") {
+			t.Errorf("reserved tag %q must not be sent to RunTask", aws.ToString(tag.Key))
+		}
 	}
 }

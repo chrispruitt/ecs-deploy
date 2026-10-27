@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.4.1
+
+### Fixed
+
+- Release and `run` tasks failed to start for any service with tags:
+  `ConflictException: The provided clientToken is already in use with a
+  different request.` RunTask rejects `propagateTags=SERVICE`, and the
+  tagless retry re-sent the input the SDK had already stamped with the first
+  attempt's client token. The service's tags are now copied onto the task
+  with `tags`, and every RunTask attempt carries its own client token.
+
 ## v0.4.0
 
 ### Added
